@@ -15,7 +15,7 @@ ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", ATTRS{idVendor}=
 
 # TRIM. Linux leaves TRIM off for USB disks (provisioning_mode=full), so fstrim
 # never reaches the drive. The T7 supports UNMAP; `cachy-t7 install` checks that
-# with sg_vpd before it installs this line.
+# in the drive's provisioning page before it installs this line.
 ACTION=="add|change", SUBSYSTEM=="scsi_disk", ATTRS{idVendor}=="04e8", ATTRS{product}=="PSSD T7*", ATTR{provisioning_mode}="unmap"
 
 # USB power. Never autosuspend the link of a disk the OS runs from.

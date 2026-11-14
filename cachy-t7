@@ -110,13 +110,22 @@ cmd_status() {
 
 need_root() { [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"; }
 
-# 0 when every attached T7 reports the UNMAP command supported (LBPU 1).
+# 1 when the drive reports the UNMAP command supported: the LBPU bit (byte 5, bit 7)
+# of its Logical Block Provisioning VPD page, which the kernel caches as vpd_pgb2.
+lbpu_bit() {
+	local page="/sys/block/$1/device/vpd_pgb2" byte
+	# sysfs files report size 0, so read rather than test -s.
+	[ -r "$page" ] || { echo 0; return; }
+	byte=$(od -An -tu1 -j5 -N1 "$page" 2>/dev/null | tr -d ' ')
+	echo $(( ${byte:-0} >> 7 & 1 ))
+}
+
+# 0 when every given T7 reports the UNMAP command supported.
 trim_supported() {
 	local dev
-	command -v sg_vpd >/dev/null || { echo "sg_vpd not found (pacman -S sg3_utils)" >&2; return 1; }
 	for dev in "$@"; do
-		if ! sg_vpd -p lbpv "/dev/$dev" 2>/dev/null | grep -Eq 'LBPU\)?: *1'; then
-			echo "/dev/$dev does not report UNMAP support" >&2
+		if [ "$(lbpu_bit "$dev")" != 1 ]; then
+			echo "/dev/$dev does not report UNMAP support (LBPU bit of vpd_pgb2)" >&2
 			return 1
 		fi
 	done

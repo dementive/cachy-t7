@@ -18,8 +18,9 @@ the same disk settings, so both systems behave the same.
 so one file serves both drives. After a `git pull` of a changed rules file, run
 `install` again: `status` says DIFF when the installed copy differs from the repo.
 
-`install` first checks with `sg_vpd` (package `sg3_utils`) that every attached
-T7 reports TRIM (UNMAP) support, and refuses otherwise. `install --no-trim`
+`install` first checks that every attached T7 reports TRIM (UNMAP) support: the
+LBPU bit of the drive's Logical Block Provisioning page, which the kernel keeps
+in `/sys/block/<dev>/device/vpd_pgb2`. It refuses otherwise. `install --no-trim`
 installs everything but the TRIM line.
 
 ## What it sets, and why
