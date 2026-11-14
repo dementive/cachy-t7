@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+# cachy-t7: keep the same disk settings on every Samsung T7 that runs CachyOS.
+# Usage: cachy-t7 [status | install [--no-trim] | trim | uninstall]
+set -euo pipefail
+
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+RULES_SRC="$HERE/rules/62-cachy-t7.rules"
+RULES_DST=/etc/udev/rules.d/62-cachy-t7.rules
+
+# The values the rules set, for `status`.
+WANT_STRICT=0
+WANT_MAX_RATIO=100
+WANT_READ_AHEAD=1024
+WANT_SCHED=mq-deadline
+WANT_PROVISIONING=unmap
+WANT_POWER=on
+
+if [ -t 1 ]; then OK=$'\e[32mOK\e[0m'; DIFF=$'\e[31mDIFF\e[0m'; else OK=OK; DIFF=DIFF; fi
+
+die() { echo "cachy-t7: $*" >&2; exit 1; }
+
+# The USB device directory a block device hangs off, or nothing.
+usb_parent() {
+	local p
+	p=$(readlink -f "/sys/block/$1/device")
+	while [ "$p" != "/" ]; do
+		if [ -f "$p/idVendor" ] && [ -f "$p/product" ]; then
+			echo "$p"
+			return
+		fi
+		p=$(dirname "$p")
+	done
+}
+
+# Every attached T7, as block device names (sda, sdb, ...).
+find_t7s() {
+	local dev usb
+	for dev in /sys/block/sd*; do
+		[ -e "$dev" ] || continue
+		dev=${dev##*/}
+		usb=$(usb_parent "$dev")
+		[ -n "$usb" ] || continue
+		if [ "$(cat "$usb/idVendor")" = "04e8" ] && [[ "$(cat "$usb/product")" == "PSSD T7"* ]]; then
+			echo "$dev"
+		fi
+	done
+}
+
+# The scheduler in use: the bracketed word of queue/scheduler.
+current_sched() { sed -n 's/.*\[\(.*\)\].*/\1/p' "/sys/block/$1/queue/scheduler"; }
+
+check() { # label, have, want
+	if [ "$2" = "$3" ]; then printf '  %-4s %-22s %s\n' "$OK" "$1" "$2"
+	else printf '  %-4s %-22s %s (want %s)\n' "$DIFF" "$1" "$2" "$3"; fi
+}
+
+cmd_status() {
+	local devs dev usb serial root_src root_dev
+	mapfile -t devs < <(find_t7s)
+	[ "${#devs[@]}" -gt 0 ] || die "no Samsung T7 attached"
+	root_src=$(findmnt -no SOURCE /)
+	root_dev=$(lsblk -no PKNAME "$root_src" 2>/dev/null || true)
+
+	if [ -f "$RULES_DST" ]; then
+		if cmp -s <(grep -v provisioning_mode "$RULES_SRC") <(grep -v provisioning_mode "$RULES_DST"); then
+			if grep -q provisioning_mode "$RULES_DST"; then echo "rules: $OK  $RULES_DST matches the repo"
+			else echo "rules: $OK  $RULES_DST matches the repo (installed with --no-trim)"; fi
+		else
+			echo "rules: $DIFF $RULES_DST differs from the repo: run cachy-t7 install"
+		fi
+	else
+		echo "rules: $DIFF not installed: run cachy-t7 install"
+	fi
+
+	for dev in "${devs[@]}"; do
+		usb=$(usb_parent "$dev")
+		serial=$(cat "$usb/serial" 2>/dev/null || echo "?")
+		echo
+		echo "/dev/$dev  $(cat "$usb/product")  serial $serial$([ "$dev" = "$root_dev" ] && echo "  (holds /)")"
+		echo "  link: $(cat "$usb/speed") Mbit/s, driver $(basename "$(readlink -f "$(ls -d "$usb"/*:1.0 | head -1)/driver")")"
+		check "write cap strict" "$(cat "/sys/block/$dev/bdi/strict_limit")" "$WANT_STRICT"
+		check "write cap max_ratio" "$(cat "/sys/block/$dev/bdi/max_ratio")" "$WANT_MAX_RATIO"
+		check "read-ahead KB" "$(cat "/sys/block/$dev/queue/read_ahead_kb")" "$WANT_READ_AHEAD"
+		check "scheduler" "$(current_sched "$dev")" "$WANT_SCHED"
+		check "TRIM mode" "$(cat /sys/block/"$dev"/device/scsi_disk/*/provisioning_mode)" "$WANT_PROVISIONING"
+		check "USB power control" "$(cat "$usb/power/control")" "$WANT_POWER"
+		if [ "$(cat "/sys/block/$dev/queue/discard_max_bytes")" = "0" ]; then
+			echo "  note: discard_max_bytes is 0, TRIM does not reach this drive"
+		fi
+	done
+
+	echo
+	if systemctl is-enabled --quiet fstrim.timer 2>/dev/null; then echo "fstrim.timer: $OK  enabled"
+	else echo "fstrim.timer: $DIFF not enabled (install enables it)"; fi
+	if [ -n "$root_dev" ] && printf '%s\n' "${devs[@]}" | grep -qx "$root_dev"; then
+		local opts
+		opts=$(findmnt -no OPTIONS /)
+		if [[ ",$opts," == *",noatime,"* ]]; then echo "/ mount: $OK  noatime"
+		else echo "/ mount: $DIFF no noatime in $opts (set it in /etc/fstab by hand)"; fi
+		if [ "$(findmnt -no FSTYPE /)" = "xfs" ]; then
+			local logbsize
+			logbsize=$(sed -n 's/.*logbsize=\([^,]*\).*/\1/p' <<< "$opts")
+			if [ "$logbsize" = "256k" ]; then echo "/ mount: $OK  logbsize=256k"
+			elif grep -qs -- "$ROOTFLAGS" "$LIMINE_DEFAULTS" && ! grep -q -- "$ROOTFLAGS" /proc/cmdline; then
+				echo "/ mount: $DIFF logbsize=${logbsize:-default} ($ROOTFLAGS is configured; reboot to apply)"
+			else echo "/ mount: $DIFF logbsize=${logbsize:-default} (cachy-t7 install adds $ROOTFLAGS on Limine)"; fi
+		fi
+	fi
+}
+
+need_root() { [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"; }
+
+# 0 when every attached T7 reports the UNMAP command supported (LBPU 1).
+trim_supported() {
+	local dev
+	command -v sg_vpd >/dev/null || { echo "sg_vpd not found (pacman -S sg3_utils)" >&2; return 1; }
+	for dev in "$@"; do
+		if ! sg_vpd -p lbpv "/dev/$dev" 2>/dev/null | grep -Eq 'LBPU\)?: *1'; then
+			echo "/dev/$dev does not report UNMAP support" >&2
+			return 1
+		fi
+	done
+}
+
+LIMINE_DEFAULTS=/etc/default/limine
+ROOTFLAGS=rootflags=logbsize=256k
+
+# 0 when / is XFS on one of the given T7s.
+root_is_xfs_on_t7() {
+	local root_dev
+	root_dev=$(lsblk -no PKNAME "$(findmnt -no SOURCE /)" 2>/dev/null || true)
+	[ "$(findmnt -no FSTYPE /)" = "xfs" ] && printf '%s\n' "$@" | grep -qx "$root_dev"
+}
+
+# Append $ROOTFLAGS inside the quotes of the first KERNEL_CMDLINE[default] line of file $1.
+add_rootflags_to() {
+	sed -i -E "0,/^(KERNEL_CMDLINE\[default\]\+?=\")([^\"]*)\"/s//\1\2 $ROOTFLAGS\"/" "$1"
+}
+
+# Remove $ROOTFLAGS from file $1.
+remove_rootflags_from() {
+	sed -i -E "s/ ?$ROOTFLAGS//" "$1"
+}
+
+# The kernel command line half of the XFS log buffer (README: "logbsize"): fstab
+# cannot set it for /, so on Limine it goes into KERNEL_CMDLINE, with a backup and
+# a rollback when limine-update fails. Any other bootloader gets the line to add.
+ensure_rootflags() {
+	root_is_xfs_on_t7 "$@" || return 0
+	if [ ! -f "$LIMINE_DEFAULTS" ]; then
+		echo "kernel command line: not Limine; add $ROOTFLAGS to your bootloader's kernel command line by hand"
+		return 0
+	fi
+	if grep -q -- "$ROOTFLAGS" "$LIMINE_DEFAULTS"; then
+		echo "kernel command line: $ROOTFLAGS already in $LIMINE_DEFAULTS"
+		return 0
+	fi
+	if grep -q -- 'rootflags=' "$LIMINE_DEFAULTS"; then
+		echo "kernel command line: $LIMINE_DEFAULTS already has other rootflags; add logbsize=256k to them by hand"
+		return 0
+	fi
+	local backup
+	backup="$LIMINE_DEFAULTS.cachy-t7.$(date +%Y%m%d-%H%M%S).bak"
+	cp -a "$LIMINE_DEFAULTS" "$backup"
+	add_rootflags_to "$LIMINE_DEFAULTS"
+	if ! grep -q -- "$ROOTFLAGS" "$LIMINE_DEFAULTS"; then
+		cp -a "$backup" "$LIMINE_DEFAULTS"
+		die "found no KERNEL_CMDLINE[default] line in $LIMINE_DEFAULTS; nothing changed"
+	fi
+	if ! limine-update; then
+		cp -a "$backup" "$LIMINE_DEFAULTS"
+		limine-update || true
+		die "limine-update failed; $LIMINE_DEFAULTS restored from $backup"
+	fi
+	echo "kernel command line: added $ROOTFLAGS (backup $backup); reboot to apply"
+}
+
+# The reverse of ensure_rootflags, for uninstall.
+drop_rootflags() {
+	[ -f "$LIMINE_DEFAULTS" ] && grep -q -- "$ROOTFLAGS" "$LIMINE_DEFAULTS" || return 0
+	cp -a "$LIMINE_DEFAULTS" "$LIMINE_DEFAULTS.cachy-t7.$(date +%Y%m%d-%H%M%S).bak"
+	remove_rootflags_from "$LIMINE_DEFAULTS"
+	limine-update
+	echo "kernel command line: removed $ROOTFLAGS; reboot to apply"
+}
+
+reload() {
+	udevadm control --reload
+	udevadm trigger --action=change --subsystem-match=block --subsystem-match=scsi_disk --subsystem-match=usb
+	udevadm settle
+}
+
+cmd_install() {
+	need_root install "$@"
+	local no_trim=0 devs
+	[ "${1:-}" = "--no-trim" ] && no_trim=1
+	mapfile -t devs < <(find_t7s)
+	[ "${#devs[@]}" -gt 0 ] || die "no Samsung T7 attached"
+	if [ "$no_trim" = 0 ] && ! trim_supported "${devs[@]}"; then
+		die "TRIM is not confirmed on every T7; rerun with --no-trim to install the rest"
+	fi
+	if [ "$no_trim" = 1 ]; then
+		grep -v provisioning_mode "$RULES_SRC" > "$RULES_DST"
+	else
+		install -m 0644 "$RULES_SRC" "$RULES_DST"
+	fi
+	chmod 0644 "$RULES_DST"
+	echo "installed $RULES_DST"
+	reload
+	systemctl enable --now fstrim.timer
+	ensure_rootflags "${devs[@]}"
+	echo
+	cmd_status
+	if [ "$no_trim" = 0 ]; then
+		echo
+		echo "Next: cachy-t7 trim (once; the first trim of a never-trimmed drive can take a minute)"
+	fi
+}
+
+cmd_trim() {
+	need_root trim "$@"
+	fstrim -av
+}
+
+cmd_uninstall() {
+	need_root uninstall "$@"
+	rm -f "$RULES_DST"
+	echo "removed $RULES_DST"
+	reload
+	drop_rootflags
+	echo "CachyOS's own rules apply again; read-ahead and the scheduler return to their defaults at the next boot."
+}
+
+case "${1:-status}" in
+	status) cmd_status ;;
+	install) shift; cmd_install "$@" ;;
+	trim) shift; cmd_trim "$@" ;;
+	uninstall) shift; cmd_uninstall "$@" ;;
+	-h|--help|help) sed -n '2,3p' "$0" | sed 's/^# //' ;;
+	*) die "unknown command $1 (status, install [--no-trim], trim, uninstall)" ;;
+esac

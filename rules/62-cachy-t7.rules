@@ -1,0 +1,22 @@
+# cachy-t7: settings for Samsung T7 portable SSDs used as a system disk.
+# Matches any T7 (USB vendor 04e8, product "PSSD T7*": T7, T7 Touch, T7 Shield).
+# Named 62 so it runs after CachyOS's 61-writeback-limits.rules, whose values it
+# overrides for these drives. See README.md for the why of every line.
+
+# Write cap. CachyOS caps every USB disk at 16 MB of unwritten data and enforces
+# that even when the system has room (strict_limit=1). A T7 holding the OS and a
+# build then crawls: one 357 MB link took 336 s with it and 2.3 s without.
+# strict_limit=0 and max_ratio=100 are the kernel's defaults: the T7 shares the
+# system dirty limit like an internal SSD.
+# Read-ahead. The T7's bridge reports a 32 MB optimal transfer size, so the kernel
+# reads up to 64 MB ahead on each file; 1 MB suits thousands of small reads.
+# Scheduler. mq-deadline, CachyOS's own choice for SSDs, pinned so both systems match.
+ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", ATTRS{idVendor}=="04e8", ATTRS{product}=="PSSD T7*", ATTR{bdi/strict_limit}="0", ATTR{bdi/max_ratio}="100", ATTR{queue/read_ahead_kb}="1024", ATTR{queue/scheduler}="mq-deadline"
+
+# TRIM. Linux leaves TRIM off for USB disks (provisioning_mode=full), so fstrim
+# never reaches the drive. The T7 supports UNMAP; `cachy-t7 install` checks that
+# with sg_vpd before it installs this line.
+ACTION=="add|change", SUBSYSTEM=="scsi_disk", ATTRS{idVendor}=="04e8", ATTRS{product}=="PSSD T7*", ATTR{provisioning_mode}="unmap"
+
+# USB power. Never autosuspend the link of a disk the OS runs from.
+ACTION=="add|change", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="04e8", ATTR{product}=="PSSD T7*", TEST=="power/control", ATTR{power/control}="on"
